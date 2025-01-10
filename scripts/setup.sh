@@ -21,6 +21,14 @@ has() {
   done
 }
 
+sudo() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    env sudo "$@"
+  fi
+}
+
 script_failure() {
   if [ -n "${1:-}" ]; then
     _line="on line $1"
@@ -58,9 +66,6 @@ if [ "${CI:-}" != "true" ]; then
       'https://rustup.rs'
   fi
 
-  echo "Installing Rust tools..."
-  cargo install cargo-watch
-
   echo
 fi
 
@@ -83,15 +88,15 @@ if [ "${1:-}" = "mobile" ]; then
   # Android targets
   echo "Installing Android targets for Rust..."
 
-  rustup target add armv7-linux-androideabi  # for arm
-  rustup target add aarch64-linux-android    # for arm64
-  rustup target add i686-linux-android       # for x86
-  rustup target add x86_64-linux-android     # for x86_64
-  rustup target add x86_64-unknown-linux-gnu # for linux-x86-64
-  rustup target add aarch64-apple-darwin     # for darwin arm64 (if you have an M1 Mac)
-  rustup target add x86_64-apple-darwin      # for darwin x86_64 (if you have an Intel Mac)
-  rustup target add x86_64-pc-windows-gnu    # for win32-x86-64-gnu
-  rustup target add x86_64-pc-windows-msvc   # for win32-x86-64-msvc
+  if [ "${CI:-}" = "true" ]; then
+    # TODO: This need to be adjusted for future mobile release CI
+    rustup target add x86_64-linux-android
+  else
+    rustup target add \
+      aarch64-linux-android \
+      armv7-linux-androideabi \
+      x86_64-linux-android
+  fi
 
   echo
 else
@@ -101,12 +106,9 @@ fi
 # Install system deps
 case "$(uname)" in
   "Darwin")
-    if [ "$(uname -m)" = 'x86_64' ]; then (
-      if [ "${CI:-}" = "true" ]; then
-        export NONINTERACTIVE=1
-      fi
+    if [ "$(uname -m)" = 'x86_64' ] && ! [ "${CI:-}" = "true" ]; then
       brew install nasm
-    ); fi
+    fi
 
     # Install rust deps for iOS
     if [ $MOBILE -eq 1 ]; then
@@ -118,35 +120,39 @@ case "$(uname)" in
 
       echo "Installing iOS targets for Rust..."
 
-      rustup target add aarch64-apple-ios
-      rustup target add aarch64-apple-ios-sim
-      rustup target add x86_64-apple-ios # for CI
+      case "$(uname -m)" in
+        "arm64" | "aarch64") # M series
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          ;;
+        "x86_64") # Intel
+          rustup target add x86_64-apple-ios aarch64-apple-ios
+          ;;
+        *)
+          err 'Unsupported architecture for CI build.'
+          ;;
+      esac
 
       echo
     fi
     ;;
-  "Linux") # https://github.com/tauri-apps/tauri-docs/blob/dev/docs/guides/getting-started/prerequisites.md#setting-up-linux
+  "Linux")
+    # https://github.com/tauri-apps/tauri-docs/blob/dev/docs/guides/getting-started/prerequisites.md#setting-up-linux
     if has apt-get; then
       echo "Detected apt!"
       echo "Installing dependencies with apt..."
 
       # Tauri dependencies
-      set -- build-essential curl wget file patchelf openssl libssl-dev libgtk-3-dev librsvg2-dev \
-        libwebkit2gtk-4.0-dev libayatana-appindicator3-dev
-
-      # FFmpeg dependencies
-      set -- "$@" ffmpeg libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev \
-        libavutil-dev libswscale-dev libswresample-dev
+      set -- build-essential curl wget file openssl libssl-dev libgtk-3-dev librsvg2-dev \
+        libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev libdbus-1-dev
 
       # Webkit2gtk requires gstreamer plugins for video playback to work
-      set -- "$@" gstreamer1.0-alsa gstreamer1.0-gl gstreamer1.0-gtk3 gstreamer1.0-libav \
-        gstreamer1.0-pipewire gstreamer1.0-plugins-bad gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly gstreamer1.0-pulseaudio \
-        gstreamer1.0-vaapi libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-        libgstreamer-plugins-bad1.0-dev
+      set -- "$@" gstreamer1.0-plugins-good gstreamer1.0-plugins-ugly libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
 
       # C/C++ build dependencies, required to build some *-sys crates
-      set -- "$@" llvm-dev libclang-dev clang nasm
+      set -- "$@" llvm-dev libclang-dev clang nasm perl
+
+      # React dependencies
+      set -- "$@" libvips42
 
       sudo apt-get -y update
       sudo apt-get -y install "$@"
@@ -155,17 +161,13 @@ case "$(uname)" in
       echo "Installing dependencies with pacman..."
 
       # Tauri dependencies
-      set -- base-devel curl wget file patchelf openssl gtk3 librsvg webkit2gtk libayatana-appindicator
-
-      # FFmpeg dependencies
-      set -- "$@" ffmpeg
+      set -- base-devel curl wget file openssl gtk3 librsvg webkit2gtk-4.1 libayatana-appindicator xdotool dbus
 
       # Webkit2gtk requires gstreamer plugins for video playback to work
-      set -- "$@" gst-libav gst-plugins-bad gst-plugins-base gst-plugins-good gst-plugins-ugly \
-        gst-plugin-pipewire gstreamer-vaapi
+      set -- "$@" gst-plugins-base gst-plugins-good gst-plugins-ugly
 
       # C/C++ build dependencies, required to build some *-sys crates
-      set -- "$@" clang nasm
+      set -- "$@" clang nasm perl
 
       # React dependencies
       set -- "$@" libvips
@@ -176,40 +178,65 @@ case "$(uname)" in
       echo "Installing dependencies with dnf..."
 
       # For Enterprise Linux, you also need "Development Tools" instead of "C Development Tools and Libraries"
-      if ! { sudo dnf group install "C Development Tools and Libraries" || sudo sudo dnf group install "Development Tools"; }; then
+      if ! { sudo dnf group install "C Development Tools and Libraries" || sudo dnf group install "Development Tools"; }; then
         err 'We were unable to install the "C Development Tools and Libraries"/"Development Tools" package.' \
           'Please open an issue if you feel that this is incorrect.' \
           'https://github.com/spacedriveapp/spacedrive/issues'
       fi
 
-      # For Fedora 36 and below, and all Enterprise Linux Distributions, you need to install webkit2gtk3-devel instead of webkit2gtk4.0-devel
-      if ! { sudo dnf install webkit2gtk4.0-devel || sudo dnf install webkit2gtk3-devel; }; then
-        err 'We were unable to install the webkit2gtk4.0-devel/webkit2gtk3-devel package.' \
-          'Please open an issue if you feel that this is incorrect.' \
-          'https://github.com/spacedriveapp/spacedrive/issues'
-      fi
-
       # Tauri dependencies
-      set -- openssl curl wget file patchelf libappindicator-gtk3-devel librsvg2-devel
+      set -- openssl webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel libxdo-devel dbus-devel
 
       # Webkit2gtk requires gstreamer plugins for video playback to work
-      set -- "$@" gstreamer1-devel gstreamer1-plugins-base-devel \
-        gstreamer1-plugins-good gstreamer1-plugins-good-gtk \
-        gstreamer1-plugins-good-extras gstreamer1-plugins-ugly-free \
-        gstreamer1-plugins-bad-free gstreamer1-plugins-bad-free-devel \
-        gstreamer1-plugins-bad-free-extras
+      set -- "$@" gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-good \
+        gstreamer1-plugins-good-extras gstreamer1-plugins-ugly-free
 
       # C/C++ build dependencies, required to build some *-sys crates
-      set -- "$@" clang clang-devel nasm
+      set -- "$@" clang clang-devel nasm perl-core
+
+      # React dependencies
+      set -- "$@" vips
 
       sudo dnf install "$@"
+    elif has apk; then
+      echo "Detected apk!"
+      echo "Installing dependencies with apk..."
+      echo "Alpine suport is experimental" >&2
 
-      # FFmpeg dependencies
-      if ! sudo dnf install ffmpeg ffmpeg-devel; then
-        err 'We were unable to install the FFmpeg and FFmpeg-devel packages.' \
-          'This is likely because the RPM Fusion free repository is not enabled.' \
-          'https://docs.fedoraproject.org/en-US/quick-docs/setup_rpmfusion'
-      fi
+      # Tauri dependencies
+      set -- build-base curl wget file openssl-dev gtk+3.0-dev librsvg-dev \
+        webkit2gtk-4.1-dev libayatana-indicator-dev xdotool-dev dbus-dev
+
+      # Webkit2gtk requires gstreamer plugins for video playback to work
+      set -- "$@" gst-plugins-base-dev gst-plugins-good gst-plugins-ugly
+
+      # C/C++ build dependencies, required to build some *-sys crates
+      set -- "$@" llvm16-dev clang16 nasm perl
+
+      # React dependencies
+      set -- "$@" vips
+
+      sudo apk add "$@"
+    elif has eopkg; then
+      echo "Detected eopkg!"
+      echo "Installing dependencies with eopkg..."
+      echo "Solus support is experimental" >&2
+
+      # Tauri dependencies
+      set -- curl wget file openssl openssl-devel libgtk-3-devel librsvg-devel \
+        libwebkit-gtk41-devel libayatana-appindicator-devel xdotool-devel dbus-devel
+
+      # Webkit2gtk requires gstreamer plugins for video playback to work
+      set -- "$@" gstreamer-1.0-plugins-good gstreamer-1.0-plugins-ugly gstreamer-1.0-devel gstreamer-1.0-plugins-base-devel
+
+      # C/C++ build dependencies, required to build some *-sys crates
+      set -- "$@" llvm-devel llvm-clang-devel llvm-clang nasm perl
+
+      # React dependencies
+      set -- "$@" libvips
+
+      sudo eopkg it -c system.devel -y
+      sudo eopkg it "$@" -y
     else
       if has lsb_release; then
         _distro="'$(lsb_release -s -d)' "
@@ -225,5 +252,16 @@ case "$(uname)" in
       'https://github.com/spacedriveapp/spacedrive/issues'
     ;;
 esac
+
+if [ "${CI:-}" != "true" ]; then
+  echo "Installing Rust tools..."
+
+  _tools="cargo-watch"
+  if [ $MOBILE -eq 1 ]; then
+    _tools="$_tools cargo-ndk" # For building Android
+  fi
+
+  echo "$_tools" | xargs cargo install
+fi
 
 echo 'Your machine has been setup for Spacedrive development!'

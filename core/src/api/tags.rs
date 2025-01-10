@@ -1,24 +1,18 @@
+use crate::{invalidate_query, library::Library, object::tag::TagCreateArgs};
+
+use sd_prisma::{
+	prisma::{device, file_path, object, tag, tag_on_object},
+	prisma_sync,
+};
+use sd_sync::{option_sync_db_entry, sync_db_entry, sync_entry, OperationFactory};
+
 use std::collections::BTreeMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use itertools::{Either, Itertools};
 use rspc::{alpha::AlphaRouter, ErrorCode};
-use sd_file_ext::kind::ObjectKind;
-use sd_prisma::{prisma, prisma_sync};
-use sd_sync::OperationFactory;
-use sd_utils::uuid_to_bytes;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use specta::Type;
-
-use serde_json::json;
-use uuid::Uuid;
-
-use crate::{
-	invalidate_query,
-	library::Library,
-	object::tag::TagCreateArgs,
-	prisma::{file_path, object, tag, tag_on_object},
-};
 
 use super::{utils::library, Ctx, R};
 
@@ -43,6 +37,12 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 				})
 		})
 		.procedure("getWithObjects", {
+			#[derive(Serialize, Type)]
+			pub struct ObjectWithDateCreated {
+				object: object::Data,
+				date_created: DateTime<Utc>,
+			}
+
 			R.with2(library()).query(
 				|(_, library), object_ids: Vec<object::id::Type>| async move {
 					let Library { db, .. } = library.as_ref();
@@ -55,6 +55,7 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 						.select(tag::select!({
 							id
 							tag_objects(vec![tag_on_object::object_id::in_vec(object_ids.clone())]): select {
+								date_created
 								object: select {
 									id
 								}
@@ -63,17 +64,10 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 						.exec()
 						.await?;
 
+					// This doesn't need normalised caching because it doesn't return whole models.
 					Ok(tags_with_objects
 						.into_iter()
-						.map(|tag| {
-							(
-								tag.id,
-								tag.tag_objects
-									.into_iter()
-									.map(|rel| rel.object.id)
-									.collect::<Vec<_>>(),
-							)
-						})
+						.map(|tag| (tag.id, tag.tag_objects))
 						.collect::<BTreeMap<_, _>>())
 				},
 			)
@@ -92,6 +86,22 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 		.procedure("create", {
 			R.with2(library())
 				.mutation(|(_, library), args: TagCreateArgs| async move {
+					// Check if tag with the same name already exists
+					let existing_tag = library
+						.db
+						.tag()
+						.find_many(vec![tag::name::equals(Some(args.name.clone()))])
+						.select(tag::select!({ id }))
+						.exec()
+						.await?;
+
+					if !existing_tag.is_empty() {
+						return Err(rspc::Error::new(
+							ErrorCode::Conflict,
+							"Tag with the same name already exists".to_string(),
+						));
+					}
+
 					let created_tag = args.exec(&library).await?;
 
 					invalidate_query!(library, "tags.list");
@@ -103,8 +113,8 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 			#[derive(Debug, Type, Deserialize)]
 			#[specta(inline)]
 			enum Target {
-				Object(prisma::object::id::Type),
-				FilePath(prisma::file_path::id::Type),
+				Object(object::id::Type),
+				FilePath(file_path::id::Type),
 			}
 
 			#[derive(Debug, Type, Deserialize)]
@@ -118,6 +128,21 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 			R.with2(library())
 				.mutation(|(_, library), args: TagAssignArgs| async move {
 					let Library { db, sync, .. } = library.as_ref();
+
+					let device_id = library
+						.db
+						.device()
+						.find_unique(device::pub_id::equals(sync.device_pub_id.to_db()))
+						.select(device::select!({ id }))
+						.exec()
+						.await?
+						.ok_or_else(|| {
+							rspc::Error::new(
+								ErrorCode::NotFound,
+								"Local device not found".to_string(),
+							)
+						})?
+						.id;
 
 					let tag = db
 						.tag()
@@ -151,22 +176,12 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 									.select(file_path::select!({
 										id
 										pub_id
+										is_dir
 										object: select { id pub_id }
 									})),
 							)
 						})
 						.await?;
-
-					macro_rules! sync_id {
-						($pub_id:expr) => {
-							prisma_sync::tag_on_object::SyncId {
-								tag: prisma_sync::tag::SyncId {
-									pub_id: tag.pub_id.clone(),
-								},
-								object: prisma_sync::object::SyncId { pub_id: $pub_id },
-							}
-						};
-					}
 
 					if args.unassign {
 						let query = db.tag_on_object().delete_many(vec![
@@ -184,56 +199,28 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 							),
 						]);
 
-						sync.write_ops(
-							db,
-							(
-								objects
+						let ops = objects
+							.into_iter()
+							.map(|o| o.pub_id)
+							.chain(
+								file_paths
 									.into_iter()
-									.map(|o| o.pub_id)
-									.chain(
-										file_paths
-											.into_iter()
-											.filter_map(|fp| fp.object.map(|o| o.pub_id)),
-									)
-									.map(|pub_id| sync.relation_delete(sync_id!(pub_id)))
-									.collect(),
-								query,
-							),
-						)
-						.await?;
-					} else {
-						let (new_objects, _) = db
-							._batch({
-								let (left, right): (Vec<_>, Vec<_>) = file_paths
-									.iter()
-									.filter(|fp| fp.object.is_none())
-									.map(|fp| {
-										let id = uuid_to_bytes(Uuid::new_v4());
-
-										(
-											db.object().create(
-												id.clone(),
-												vec![
-													object::date_created::set(None),
-													object::kind::set(Some(
-														ObjectKind::Folder as i32,
-													)),
-												],
-											),
-											db.file_path().update(
-												file_path::id::equals(fp.id),
-												vec![file_path::object::connect(
-													object::pub_id::equals(id),
-												)],
-											),
-										)
-									})
-									.unzip();
-
-								(left, right)
+									.filter_map(|fp| fp.object.map(|o| o.pub_id)),
+							)
+							.map(|pub_id| {
+								sync.relation_delete(prisma_sync::tag_on_object::SyncId {
+									tag: prisma_sync::tag::SyncId {
+										pub_id: tag.pub_id.clone(),
+									},
+									object: prisma_sync::object::SyncId { pub_id },
+								})
 							})
-							.await?;
+							.collect::<Vec<_>>();
 
+						if !ops.is_empty() {
+							sync.write_ops(db, (ops, query)).await?;
+						}
+					} else {
 						let (sync_ops, db_creates) = objects
 							.into_iter()
 							.map(|o| (o.id, o.pub_id))
@@ -242,24 +229,46 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 									.into_iter()
 									.filter_map(|fp| fp.object.map(|o| (o.id, o.pub_id))),
 							)
-							.chain(new_objects.into_iter().map(|o| (o.id, o.pub_id)))
-							.fold(
-								(vec![], vec![]),
-								|(mut sync_ops, mut db_creates), (id, pub_id)| {
-									db_creates.push(tag_on_object::CreateUnchecked {
+							.map(|(id, pub_id)| {
+								(
+									sync.relation_create(
+										prisma_sync::tag_on_object::SyncId {
+											tag: prisma_sync::tag::SyncId {
+												pub_id: tag.pub_id.clone(),
+											},
+											object: prisma_sync::object::SyncId { pub_id },
+										},
+										[sync_entry!(
+											prisma_sync::device::SyncId {
+												pub_id: sync.device_pub_id.to_db(),
+											},
+											tag_on_object::device
+										)],
+									),
+									tag_on_object::CreateUnchecked {
 										tag_id: args.tag_id,
 										object_id: id,
-										_params: vec![],
-									});
+										_params: vec![
+											tag_on_object::date_created::set(Some(
+												Utc::now().into(),
+											)),
+											tag_on_object::device_id::set(Some(device_id)),
+										],
+									},
+								)
+							})
+							.unzip::<_, _, Vec<_>, Vec<_>>();
 
-									sync_ops.extend(sync.relation_create(sync_id!(pub_id), []));
-
-									(sync_ops, db_creates)
-								},
-							);
-
-						sync.write_ops(db, (sync_ops, db.tag_on_object().create_many(db_creates)))
+						if !sync_ops.is_empty() && !db_creates.is_empty() {
+							sync.write_ops(
+								db,
+								(
+									sync_ops,
+									db.tag_on_object().create_many(db_creates).skip_duplicates(),
+								),
+							)
 							.await?;
+						}
 					}
 
 					invalidate_query!(library, "tags.getForObject");
@@ -277,13 +286,17 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 				pub color: Option<String>,
 			}
 
-			R.with2(library())
-				.mutation(|(_, library), args: TagUpdateArgs| async move {
+			R.with2(library()).mutation(
+				|(_, library), TagUpdateArgs { id, name, color }: TagUpdateArgs| async move {
+					if name.is_none() && color.is_none() {
+						return Ok(());
+					}
+
 					let Library { sync, db, .. } = library.as_ref();
 
 					let tag = db
 						.tag()
-						.find_unique(tag::id::equals(args.id))
+						.find_unique(tag::id::equals(id))
 						.select(tag::select!({ pub_id }))
 						.exec()
 						.await?
@@ -292,56 +305,88 @@ pub(crate) fn mount() -> AlphaRouter<Ctx> {
 							"Error finding tag in db".into(),
 						))?;
 
-					db.tag()
-						.update(
-							tag::id::equals(args.id),
-							vec![tag::date_modified::set(Some(Utc::now().into()))],
-						)
-						.exec()
-						.await?;
+					let (sync_params, db_params) = [
+						option_sync_db_entry!(name, tag::name),
+						option_sync_db_entry!(color, tag::color),
+						Some(sync_db_entry!(Utc::now(), tag::date_modified)),
+					]
+					.into_iter()
+					.flatten()
+					.unzip::<_, _, Vec<_>, Vec<_>>();
 
-					sync.write_ops(
+					sync.write_op(
 						db,
-						(
-							[
-								args.name.as_ref().map(|v| (tag::name::NAME, json!(v))),
-								args.color.as_ref().map(|v| (tag::color::NAME, json!(v))),
-							]
-							.into_iter()
-							.flatten()
-							.map(|(k, v)| {
-								sync.shared_update(
-									prisma_sync::tag::SyncId {
-										pub_id: tag.pub_id.clone(),
-									},
-									k,
-									v,
-								)
-							})
-							.collect(),
-							db.tag().update(
-								tag::id::equals(args.id),
-								vec![tag::name::set(args.name), tag::color::set(args.color)],
-							),
+						sync.shared_update(
+							prisma_sync::tag::SyncId {
+								pub_id: tag.pub_id.clone(),
+							},
+							sync_params,
 						),
+						db.tag()
+							.update(tag::id::equals(id), db_params)
+							.select(tag::select!({ id })),
 					)
 					.await?;
 
 					invalidate_query!(library, "tags.list");
 
 					Ok(())
-				})
+				},
+			)
 		})
 		.procedure(
 			"delete",
 			R.with2(library())
-				.mutation(|(_, library), tag_id: i32| async move {
-					library
-						.db
+				.mutation(|(_, library), tag_id: tag::id::Type| async move {
+					let Library { sync, db, .. } = &*library;
+
+					let tag_pub_id = db
 						.tag()
-						.delete(tag::id::equals(tag_id))
+						.find_unique(tag::id::equals(tag_id))
+						.select(tag::select!({ pub_id }))
 						.exec()
-						.await?;
+						.await?
+						.ok_or(rspc::Error::new(
+							rspc::ErrorCode::NotFound,
+							"Tag not found".to_string(),
+						))?
+						.pub_id;
+
+					let delete_ops = db
+						.tag_on_object()
+						.find_many(vec![tag_on_object::tag_id::equals(tag_id)])
+						.select(tag_on_object::select!({ object: select { pub_id } }))
+						.exec()
+						.await?
+						.into_iter()
+						.map(|tag_on_object| {
+							sync.relation_delete(prisma_sync::tag_on_object::SyncId {
+								tag: prisma_sync::tag::SyncId {
+									pub_id: tag_pub_id.clone(),
+								},
+								object: prisma_sync::object::SyncId {
+									pub_id: tag_on_object.object.pub_id,
+								},
+							})
+						})
+						.collect::<Vec<_>>();
+
+					sync.write_ops(
+						db,
+						(
+							delete_ops,
+							db.tag_on_object()
+								.delete_many(vec![tag_on_object::tag_id::equals(tag_id)]),
+						),
+					)
+					.await?;
+
+					sync.write_op(
+						db,
+						sync.shared_delete(prisma_sync::tag::SyncId { pub_id: tag_pub_id }),
+						db.tag().delete(tag::id::equals(tag_id)),
+					)
+					.await?;
 
 					invalidate_query!(library, "tags.list");
 

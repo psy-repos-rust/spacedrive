@@ -10,6 +10,7 @@ import { Button } from './Button';
 export interface InputBaseProps extends VariantProps<typeof inputStyles> {
 	icon?: Icon | React.ReactNode;
 	iconPosition?: 'left' | 'right';
+	inputElementClassName?: string;
 	right?: React.ReactNode;
 }
 
@@ -18,6 +19,7 @@ export type InputProps = InputBaseProps & Omit<React.ComponentProps<'input'>, 's
 export type TextareaProps = InputBaseProps & React.ComponentProps<'textarea'>;
 
 export const inputSizes = {
+	xs: 'h-[25px]',
 	sm: 'h-[30px]',
 	md: 'h-[34px]',
 	lg: 'h-[38px]'
@@ -26,7 +28,7 @@ export const inputSizes = {
 export const inputStyles = cva(
 	[
 		'rounded-md border text-sm leading-4',
-		'shadow-sm outline-none transition-all focus-within:ring-2',
+		'outline-none transition-all focus-within:ring-2',
 		'text-ink'
 	],
 	{
@@ -35,6 +37,10 @@ export const inputStyles = cva(
 				default: [
 					'border-app-line bg-app-input placeholder-ink-faint focus-within:bg-app-focus',
 					'focus-within:border-app-divider/80 focus-within:ring-app-selected/30'
+				],
+				transparent: [
+					'border-transparent bg-transparent placeholder-ink-dull focus-within:bg-transparent',
+					'focus-within:border-transparent focus-within:ring-transparent'
 				]
 			},
 			error: {
@@ -75,15 +81,17 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
 							: createElement<IconProps>(icon as Icon, {
 									size: 18,
 									className: 'text-gray-350'
-							  })}
+								})}
 					</div>
 				)}
 
 				<input
 					className={clsx(
-						'flex-1 truncate border-none bg-transparent px-3 text-sm outline-none placeholder:text-ink-faint',
+						'flex-1 truncate border-none bg-transparent px-3 text-sm outline-none placeholder:text-ink-faint focus:!ring-0',
 						(right || (icon && iconPosition === 'right')) && 'pr-0',
-						icon && iconPosition === 'left' && 'pl-0'
+						icon && iconPosition === 'left' && 'pl-0',
+						size === 'xs' && '!py-0',
+						props.inputElementClassName
 					)}
 					onKeyDown={(e) => {
 						e.stopPropagation();
@@ -137,7 +145,7 @@ export interface LabelProps extends Omit<React.ComponentProps<'label'>, 'htmlFor
 
 export function Label({ slug, children, className, ...props }: LabelProps) {
 	return (
-		<label htmlFor={slug} className={clsx('text-sm font-bold', className)} {...props}>
+		<label htmlFor={slug} className={clsx('font-plex text-sm font-bold', className)} {...props}>
 			{children}
 		</label>
 	);
@@ -167,7 +175,7 @@ export const PasswordInput = forwardRef<HTMLInputElement, Props>((props, ref) =>
 					size="icon"
 					className={clsx(props.buttonClassnames)}
 				>
-					<CurrentEyeIcon className="!pointer-events-none h-4 w-4" />
+					<CurrentEyeIcon className="!pointer-events-none size-4" />
 				</Button>
 			}
 		/>

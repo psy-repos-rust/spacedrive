@@ -3,10 +3,11 @@ import { createContext, useContext } from 'react';
 import { useNavigate } from 'react-router';
 import {
 	currentLibraryCache,
-	getOnboardingStore,
-	getUnitFormatStore,
+	insertLibrary,
+	onboardingStore,
 	resetOnboardingStore,
-	telemetryStore,
+	telemetryState,
+	unitFormatStore,
 	useBridgeMutation,
 	useCachedLibraries,
 	useMultiZodForm,
@@ -15,6 +16,8 @@ import {
 } from '@sd/client';
 import { RadioGroupField, z } from '@sd/ui';
 import { usePlatform } from '~/util/Platform';
+
+import i18n from '../I18n';
 
 export const OnboardingContext = createContext<ReturnType<typeof useContextValue> | null>(null);
 
@@ -35,17 +38,21 @@ export const useContextValue = () => {
 };
 
 export const shareTelemetry = RadioGroupField.options([
-	z.literal('share-telemetry'),
-	z.literal('minimal-telemetry')
+	z.literal('full'),
+	z.literal('minimal'),
+	z.literal('none')
 ]).details({
-	'share-telemetry': {
-		heading: 'Share anonymous usage',
-		description:
-			'Share completely anonymous telemetry data to help the developers improve the app'
+	full: {
+		heading: i18n.t('telemetry_share_anonymous'),
+		description: i18n.t('telemetry_share_anonymous_description')
 	},
-	'minimal-telemetry': {
-		heading: 'Share the bare minimum',
-		description: 'Only share that I am an active user of Spacedrive and a few technical bits'
+	minimal: {
+		heading: i18n.t('telemetry_share_minimal'),
+		description: i18n.t('telemetry_share_minimal_description')
+	},
+	none: {
+		heading: i18n.t('telemetry_share_none'),
+		description: i18n.t('telemetry_share_none_description')
 	}
 });
 
@@ -81,7 +88,7 @@ const useFormState = () => {
 				shareTelemetry: 'share-telemetry'
 			}
 		},
-		onData: (data) => (getOnboardingStore().data = { ...obStore.data, ...data })
+		onData: (data) => (onboardingStore.data = { ...obStore.data, ...data })
 	});
 
 	const navigate = useNavigate();
@@ -90,8 +97,8 @@ const useFormState = () => {
 
 	if (window.navigator.language === 'en-US') {
 		// not perfect as some linux users use en-US by default, same w/ windows
-		getUnitFormatStore().distanceFormat = 'miles';
-		getUnitFormatStore().temperatureFormat = 'fahrenheit';
+		unitFormatStore.distanceFormat = 'miles';
+		unitFormatStore.temperatureFormat = 'fahrenheit';
 	}
 
 	const createLibrary = useBridgeMutation('library.create');
@@ -102,7 +109,7 @@ const useFormState = () => {
 
 			// opted to place this here as users could change their mind before library creation/onboarding finalization
 			// it feels more fitting to configure it here (once)
-			telemetryStore.shareFullTelemetry = data.privacy.shareTelemetry === 'share-telemetry';
+			telemetryState.telemetryLevelPreference = data.privacy.shareTelemetry;
 
 			try {
 				// show creation screen for a bit for smoothness
@@ -113,22 +120,16 @@ const useFormState = () => {
 					}),
 					new Promise((res) => setTimeout(res, 500))
 				]);
+				insertLibrary(queryClient, library);
 
-				queryClient.setQueryData(['library.list'], (libraries: any) => {
-					// The invalidation system beat us to it
-					if (libraries.find((l: any) => l.uuid === library.uuid)) return libraries;
+				if (platform.refreshMenuBar) platform.refreshMenuBar();
 
-					return [...(libraries || []), library];
-				});
-
-				platform.refreshMenuBar && platform.refreshMenuBar();
-
-				if (telemetryStore.shareFullTelemetry) {
+				if (telemetryState.telemetryLevelPreference === 'full') {
 					submitPlausibleEvent({ event: { type: 'libraryCreate' } });
 				}
 
 				resetOnboardingStore();
-				navigate(`/${library.uuid}/overview`, { replace: true });
+				navigate(`/${library.uuid}`, { replace: true });
 			} catch (e) {
 				if (e instanceof Error) {
 					alert(`Failed to create library. Error: ${e.message}`);

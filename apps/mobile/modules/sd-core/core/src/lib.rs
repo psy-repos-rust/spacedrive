@@ -1,7 +1,11 @@
+#![cfg(any(target_os = "android", target_os = "ios"))]
+
 use futures::{future::join_all, StreamExt};
 use futures_channel::mpsc;
-use once_cell::sync::{Lazy, OnceCell};
-use rspc::internal::jsonrpc::{self, *};
+use rspc::internal::jsonrpc::{
+	self, handle_json_rpc, OwnedMpscSender, Request, RequestId, Response, Sender,
+	SubscriptionUpgrade,
+};
 use sd_core::{api::Router, Node};
 use serde_json::{from_str, from_value, to_string, Value};
 use std::{
@@ -9,7 +13,7 @@ use std::{
 	collections::HashMap,
 	future::{ready, Ready},
 	marker::Send,
-	sync::Arc,
+	sync::{Arc, LazyLock, OnceLock},
 };
 use tokio::{
 	runtime::Runtime,
@@ -17,19 +21,18 @@ use tokio::{
 };
 use tracing::error;
 
-pub static RUNTIME: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());
+pub static RUNTIME: LazyLock<Runtime> = LazyLock::new(|| Runtime::new().unwrap());
 
-pub type NodeType = Lazy<Mutex<Option<(Arc<Node>, Arc<Router>)>>>;
+pub type NodeType = LazyLock<Mutex<Option<(Arc<Node>, Arc<Router>)>>>;
 
-pub static NODE: NodeType = Lazy::new(|| Mutex::new(None));
+pub static NODE: NodeType = LazyLock::new(|| Mutex::new(None));
 
 #[allow(clippy::type_complexity)]
-pub static SUBSCRIPTIONS: Lazy<Arc<futures_locks::Mutex<HashMap<RequestId, oneshot::Sender<()>>>>> =
-	Lazy::new(Default::default);
+pub static SUBSCRIPTIONS: LazyLock<
+	Arc<futures_locks::Mutex<HashMap<RequestId, oneshot::Sender<()>>>>,
+> = LazyLock::new(Default::default);
 
-pub static EVENT_SENDER: OnceCell<mpsc::Sender<Response>> = OnceCell::new();
-
-pub const CLIENT_ID: &str = "d068776a-05b6-4aaa-9001-4d01734e1944";
+pub static EVENT_SENDER: OnceLock<mpsc::Sender<Response>> = OnceLock::new();
 
 pub struct MobileSender<'a> {
 	resp: &'a mut Option<Response>,
@@ -71,16 +74,15 @@ pub fn handle_core_msg(
 				None => {
 					let _guard = Node::init_logger(&data_dir);
 
-					// TODO: probably don't unwrap
-					let new_node = Node::new(
-						data_dir,
-						sd_core::Env {
-							api_url: "https://app.spacedrive.com".to_string(),
-							client_id: CLIENT_ID.to_string(),
-						},
-					)
-					.await
-					.unwrap();
+					let new_node = match Node::new(data_dir).await {
+						Ok(node) => node,
+						Err(e) => {
+							error!(?e, "Failed to initialize node;");
+							callback(Err(query));
+							return;
+						}
+					};
+
 					node.replace(new_node.clone());
 					new_node
 				}
@@ -92,8 +94,8 @@ pub fn handle_core_msg(
 			false => from_value::<Request>(v).map(|v| vec![v]),
 		}) {
 			Ok(v) => v,
-			Err(err) => {
-				error!("failed to decode JSON-RPC request: {}", err); // Don't use tracing here because it's before the `Node` is initialised which sets that config!
+			Err(e) => {
+				error!(?e, "Failed to decode JSON-RPC request;");
 				callback(Err(query));
 				return;
 			}
@@ -131,8 +133,8 @@ pub fn spawn_core_event_listener(callback: impl Fn(String) + Send + 'static) {
 		while let Some(event) = rx.next().await {
 			let data = match to_string(&event) {
 				Ok(json) => json,
-				Err(err) => {
-					error!("Failed to serialize event: {err}");
+				Err(e) => {
+					error!(?e, "Failed to serialize event;");
 					continue;
 				}
 			};

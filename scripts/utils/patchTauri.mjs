@@ -7,7 +7,7 @@ import { promisify } from 'node:util'
 
 import * as semver from 'semver'
 
-import { copyLinuxLibs, copyWindowsDLLs } from './shared.mjs'
+import { linuxLibs, windowsDLLs } from './shared.mjs'
 
 const exec = promisify(_exec)
 const __debug = env.NODE_ENV === 'debug'
@@ -17,7 +17,7 @@ const __debug = env.NODE_ENV === 'debug'
  * @returns {Promise<string?>}
  */
 export async function tauriUpdaterKey(nativeDeps) {
-	if (env.TAURI_PRIVATE_KEY) return null
+	if (env.TAURI_SIGNING_PRIVATE_KEY) return null
 
 	// pnpm exec tauri signer generate -w
 	const privateKeyPath = path.join(nativeDeps, 'tauri.key')
@@ -44,68 +44,70 @@ export async function tauriUpdaterKey(nativeDeps) {
 		if (!(publicKey && privateKey)) throw new Error('Empty keys')
 	}
 
-	env.TAURI_PRIVATE_KEY = privateKey
-	env.TAURI_KEY_PASSWORD = ''
+	env.TAURI_SIGNING_PRIVATE_KEY = privateKey
+	env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ''
 	return publicKey
 }
 
 /**
  * @param {string} root
  * @param {string} nativeDeps
+ * @param {string[]} targets
  * @param {string[]} args
  * @returns {Promise<string[]>}
  */
-export async function patchTauri(root, nativeDeps, args) {
+export async function patchTauri(root, nativeDeps, targets, args) {
 	if (args.findIndex(e => e === '-c' || e === '--config') !== -1) {
 		throw new Error('Custom tauri build config is not supported.')
 	}
 
-	// Location for desktop app tauri code
-	const tauriRoot = path.join(root, 'apps', 'desktop', 'src-tauri')
-
 	const osType = os.type()
-	const resources =
-		osType === 'Linux'
-			? await copyLinuxLibs(root, nativeDeps)
-			: osType === 'Windows_NT'
-			? await copyWindowsDLLs(root, nativeDeps)
-			: { files: [], toClean: [] }
 	const tauriPatch = {
-		tauri: {
-			bundle: {
-				macOS: {
-					minimumSystemVersion: '',
-				},
-				resources: resources.files,
-			},
+		build: {
+			features: /** @type {string[]} */ ([]),
+		},
+		bundle: {
+			macOS: { minimumSystemVersion: '' },
+			resources: {},
+		},
+		plugins: {
 			updater: /** @type {{ pubkey?: string }} */ ({}),
 		},
 	}
 
+	if (osType === 'Linux') {
+		tauriPatch.bundle.resources = await linuxLibs(nativeDeps)
+	} else if (osType === 'Windows_NT') {
+		tauriPatch.bundle.resources = {
+			...(await windowsDLLs(nativeDeps)),
+			[path.join(nativeDeps, 'models', 'yolov8s.onnx')]: './models/yolov8s.onnx',
+		}
+	}
+
+	// Location for desktop app tauri code
+	const tauriRoot = path.join(root, 'apps', 'desktop', 'src-tauri')
 	const tauriConfig = await fs
 		.readFile(path.join(tauriRoot, 'tauri.conf.json'), 'utf-8')
 		.then(JSON.parse)
 
-	if (args[0] === 'build') {
-		if (tauriConfig?.tauri?.updater?.active) {
-			const pubKey = await tauriUpdaterKey(nativeDeps)
-			if (pubKey != null) tauriPatch.tauri.updater.pubkey = pubKey
+	switch (args[0]) {
+		case 'dev':
+			tauriPatch.build.features.push('devtools')
+			break
+		case 'build': {
+			if (tauriConfig?.bundle?.createUpdaterArtifacts !== false) {
+				const pubKey = await tauriUpdaterKey(nativeDeps)
+				if (pubKey != null) tauriPatch.plugins.updater.pubkey = pubKey
+			}
+			break
 		}
 	}
 
 	if (osType === 'Darwin') {
-		// ARM64 support was added in macOS 11, but we need at least 11.2 due to our ffmpeg build
-		const macOSArm64MinimumVersion = '11.2'
+		// arm64 support was added in macOS 11.0
+		const macOSArm64MinimumVersion = '11.0'
 
-		let macOSMinimumVersion = tauriConfig?.tauri?.bundle?.macOS?.minimumSystemVersion
-
-		const targets = args
-			.filter((_, index, args) => {
-				if (index === 0) return false
-				const previous = args[index - 1]
-				return previous === '-t' || previous === '--target'
-			})
-			.flatMap(target => target.split(','))
+		let macOSMinimumVersion = tauriConfig?.bundle?.macOS?.minimumSystemVersion
 
 		if (
 			(targets.includes('aarch64-apple-darwin') ||
@@ -126,7 +128,7 @@ export async function patchTauri(root, nativeDeps, args) {
 
 		if (macOSMinimumVersion) {
 			env.MACOSX_DEPLOYMENT_TARGET = macOSMinimumVersion
-			tauriPatch.tauri.bundle.macOS.minimumSystemVersion = macOSMinimumVersion
+			tauriPatch.bundle.macOS.minimumSystemVersion = macOSMinimumVersion
 		} else {
 			throw new Error('No minimum macOS version detected, please review tauri.conf.json')
 		}
@@ -139,5 +141,5 @@ export async function patchTauri(root, nativeDeps, args) {
 	args.splice(1, 0, '-c', tauriPatchConf)
 
 	// Files to be removed
-	return [tauriPatchConf, ...resources.toClean]
+	return [tauriPatchConf]
 }

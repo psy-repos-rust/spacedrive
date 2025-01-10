@@ -1,10 +1,23 @@
-import { ArrowLeft, ArrowRight, DotsThree, Plus, SidebarSimple, X } from '@phosphor-icons/react';
+import {
+	ArrowLeft,
+	ArrowRight,
+	DotsThree,
+	MagnifyingGlassMinus,
+	MagnifyingGlassPlus,
+	Plus,
+	SidebarSimple,
+	Slideshow,
+	Warning,
+	WarningCircle,
+	X
+} from '@phosphor-icons/react';
 import * as Dialog from '@radix-ui/react-dialog';
 import clsx from 'clsx';
 import {
 	ButtonHTMLAttributes,
 	createContext,
 	createRef,
+	EventHandler,
 	useCallback,
 	useContext,
 	useEffect,
@@ -12,18 +25,21 @@ import {
 	useRef,
 	useState
 } from 'react';
+import { useKey } from 'rooks';
 import {
+	ExplorerItem,
 	getEphemeralPath,
 	getExplorerItemData,
 	getIndexedItemFilePath,
 	ObjectKindKey,
+	useExplorerLayoutStore,
 	useLibraryContext,
 	useLibraryMutation,
 	useRspcLibraryContext,
 	useZodForm
 } from '@sd/client';
-import { dialogManager, DropdownMenu, Form, toast, ToastMessage, Tooltip, z } from '@sd/ui';
-import { useIsDark, useKeybind, useOperatingSystem, useShortcut } from '~/hooks';
+import { DropdownMenu, Form, toast, ToastMessage, Tooltip, z } from '@sd/ui';
+import { useIsDark, useLocale, useOperatingSystem, useShortcut } from '~/hooks';
 import { usePlatform } from '~/util/Platform';
 
 import { useExplorerContext } from '../Context';
@@ -34,9 +50,14 @@ import ExplorerContextMenu, {
 	SharedItems
 } from '../ContextMenu';
 import { Conditional } from '../ContextMenu/ConditionalItem';
-import { FileThumb } from '../FilePath/Thumb';
+import { FileThumb, ThumbType } from '../FilePath/Thumb';
 import { SingleItemMetadata } from '../Inspector';
+import { explorerStore } from '../store';
+import { useExplorerViewContext } from '../View/Context';
+import { ImageSlider } from './ImageSlider';
 import { getQuickPreviewStore, useQuickPreviewStore } from './store';
+
+export type QuickPreviewItem = { item: ExplorerItem; index: number };
 
 const iconKinds: ObjectKindKey[] = ['Audio', 'Folder', 'Executable', 'Unknown'];
 const textKinds: ObjectKindKey[] = ['Text', 'Config', 'Code'];
@@ -57,66 +78,79 @@ export const QuickPreview = () => {
 	const isDark = useIsDark();
 	const { library } = useLibraryContext();
 	const { openFilePaths, openEphemeralFiles } = usePlatform();
-
+	const explorerLayoutStore = useExplorerLayoutStore();
 	const explorer = useExplorerContext();
+	const explorerView = useExplorerViewContext();
 	const { open, itemIndex } = useQuickPreviewStore();
 
 	const thumb = createRef<HTMLDivElement>();
-	const [thumbErrorToast, setThumbErrorToast] = useState<ToastMessage>();
 	const [showMetadata, setShowMetadata] = useState<boolean>(false);
+	const [magnification, setMagnification] = useState<number>(1);
 	const [isContextMenuOpen, setIsContextMenuOpen] = useState<boolean>(false);
 	const [isRenaming, setIsRenaming] = useState<boolean>(false);
 	const [newName, setNewName] = useState<string | null>(null);
-	const os = useOperatingSystem();
+	const [thumbnailLoading, setThumbnailLoading] = useState({
+		icon: 'notLoaded',
+		thumbnail: 'notLoaded',
+		original: 'notLoaded'
+	} as {
+		[K in ThumbType]: 'notLoaded' | 'loaded' | 'error';
+	});
+	// the purpose of these refs is to prevent "jittering" when zooming with trackpads, as the deltaY value can be very high
+	const deltaYRef = useRef(0);
+	const lastZoomTimeRef = useRef(0);
 
-	const items = useMemo(
-		() => (open ? [...explorer.selectedItems] : []),
-		[explorer.selectedItems, open]
+	const hasError = useMemo(
+		() => Object.values(thumbnailLoading).some((status) => status === 'error'),
+		[thumbnailLoading]
+	);
+	const isLoaded = useMemo(
+		() => Object.values(thumbnailLoading).some((status) => status === 'loaded'),
+		[thumbnailLoading]
 	);
 
-	const item = useMemo(() => items[itemIndex] ?? null, [items, itemIndex]);
+	const { t } = useLocale();
+
+	const items = useMemo(() => {
+		if (!open || !explorer.items || explorer.selectedItems.size === 0) return [];
+
+		const items: QuickPreviewItem[] = [];
+
+		// Sort selected items
+		for (let i = 0; i < explorer.items.length; i++) {
+			const item = explorer.items[i];
+			if (!item) continue;
+
+			if (explorer.selectedItems.has(item)) items.push({ item, index: i });
+			if (items.length === explorer.selectedItems.size) break;
+		}
+
+		return items;
+	}, [explorer.items, explorer.selectedItems, open]);
+
+	const item = useMemo(() => items[itemIndex]?.item ?? null, [items, itemIndex]);
+
+	const activeItem = items[itemIndex];
 
 	const renameFile = useLibraryMutation(['files.renameFile'], {
 		onError: () => setNewName(null),
-		onSuccess: () => rspc.queryClient.invalidateQueries(['search.paths'])
+		onSuccess: () => rspc.queryClient.invalidateQueries({ queryKey: ['search.paths'] })
 	});
 
 	const renameEphemeralFile = useLibraryMutation(['ephemeralFiles.renameFile'], {
 		onError: () => setNewName(null),
-		onSuccess: () => rspc.queryClient.invalidateQueries(['search.paths'])
+		onSuccess: () => rspc.queryClient.invalidateQueries({ queryKey: ['search.paths'] })
 	});
 
 	const changeCurrentItem = (index: number) => {
 		if (items[index]) getQuickPreviewStore().itemIndex = index;
 	};
 
-	// Error toast
-	useEffect(() => {
-		if (!thumbErrorToast) return;
-
-		let id: string | number | undefined;
-		toast.error(
-			(_id) => {
-				id = _id;
-				return thumbErrorToast;
-			},
-			{
-				ref: thumb,
-				duration: Infinity,
-				onClose() {
-					id = undefined;
-					setThumbErrorToast(undefined);
-				}
-			}
-		);
-
-		return () => void toast.dismiss(id);
-	}, [thumb, thumbErrorToast]);
-
 	// Reset state
 	useEffect(() => {
 		setNewName(null);
-		setThumbErrorToast(undefined);
+		setMagnification(1);
+		setThumbnailLoading({ icon: 'notLoaded', thumbnail: 'notLoaded', original: 'notLoaded' });
 
 		if (open || item) return;
 
@@ -125,19 +159,111 @@ export const QuickPreview = () => {
 		setShowMetadata(false);
 	}, [item, open]);
 
-	// Toggle quick preview
-	useShortcut('toggleQuickPreview', (e) => {
-		if (isRenaming) return;
+	useEffect(() => {
+		if (open) explorerView.updateActiveItem(null, { updateFirstItem: true });
 
-		e.preventDefault();
+		// "open" is excluded, as we only want this to trigger when hashes change,
+		// that way we don't have to manually update the active item.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [explorer.selectedItemHashes, explorerView.updateActiveItem]);
 
-		getQuickPreviewStore().open = !open;
+	// TODO: look here - jam
+	const handleMoveBetweenItems = (step: number) => {
+		const nextPreviewItem = items[itemIndex + step];
+		if (nextPreviewItem) {
+			getQuickPreviewStore().itemIndex = itemIndex + step;
+			return;
+		}
+
+		if (!activeItem || !explorer.items) return;
+		if (items.length > 1 && !explorerLayoutStore.showImageSlider) return;
+
+		const newSelectedItem =
+			items.length > 1 &&
+			(activeItem.index === 0 || activeItem.index === explorer.items.length - 1)
+				? activeItem.item
+				: explorer.items[activeItem.index + step];
+
+		if (!newSelectedItem) return;
+
+		explorer.resetSelectedItems([newSelectedItem]);
+		getQuickPreviewStore().itemIndex = 0;
+	};
+
+	const handleZoomIn = useCallback(() => {
+		setMagnification((currentMagnification) =>
+			currentMagnification < 2
+				? currentMagnification + currentMagnification * 0.1
+				: currentMagnification
+		);
+	}, []);
+
+	const handleZoomOut = useCallback(() => {
+		setMagnification((currentMagnification) =>
+			currentMagnification > 0.5 ? currentMagnification / (1 + 0.1) : currentMagnification
+		);
+	}, []);
+
+	// pinch support for trackpads
+	const applyZoom = useCallback(() => {
+		if (deltaYRef.current < 0) {
+			handleZoomIn();
+		} else if (deltaYRef.current > 0) {
+			handleZoomOut();
+		}
+		deltaYRef.current = 0;
+	}, [handleZoomIn, handleZoomOut]);
+
+	const handleWheel = useCallback(
+		(event: WheelEvent) => {
+			if (event.ctrlKey) {
+				event.preventDefault();
+				deltaYRef.current += event.deltaY;
+				const now = Date.now();
+				if (now - lastZoomTimeRef.current > 50) {
+					applyZoom();
+					lastZoomTimeRef.current = now;
+				}
+			}
+		},
+		[applyZoom]
+	);
+
+	useEffect(() => {
+		window.addEventListener('wheel', handleWheel, { passive: false });
+		return () => {
+			window.removeEventListener('wheel', handleWheel);
+		};
+	}, [handleWheel]);
+
+	useShortcut('zoomIn', handleZoomIn);
+	useShortcut('zoomOut', handleZoomOut);
+
+	useShortcut('quickPreviewMoveBack', () => {
+		if (isContextMenuOpen || isRenaming) return;
+		handleMoveBetweenItems(-1);
 	});
 
-	// Move between items
-	useShortcut('quickPreviewMoveBetweenItems', (e) => {
+	useShortcut('quickPreviewMoveForward', () => {
 		if (isContextMenuOpen || isRenaming) return;
-		changeCurrentItem(e.key === 'ArrowLeft' ? itemIndex - 1 : itemIndex + 1);
+		handleMoveBetweenItems(1);
+	});
+
+	useKey('ArrowDown', () => {
+		if (items.length < 2 || !activeItem) return;
+		explorer.resetSelectedItems([activeItem.item]);
+		getQuickPreviewStore().itemIndex = 0;
+	});
+
+	//close quick preview
+	useShortcut('closeQuickPreview', (e) => {
+		if (explorerStore.isCMDPOpen) return;
+		e.preventDefault();
+		e.stopPropagation();
+		// set timeout is to move the state change to the next event loop
+		setTimeout(() => {
+			getQuickPreviewStore().open = false;
+		}, 0);
 	});
 
 	// Toggle metadata
@@ -159,8 +285,8 @@ export const QuickPreview = () => {
 			}
 		} catch (error) {
 			toast.error({
-				title: 'Failed to open file',
-				body: `Couldn't open file, due to an error: ${error}`
+				title: t('failed_to_open_file_title'),
+				body: t('failed_to_open_file_body', { error: error })
 			});
 		}
 	});
@@ -173,14 +299,13 @@ export const QuickPreview = () => {
 
 	const background = !withoutBackgroundKinds.includes(kind);
 	const icon = iconKinds.includes(kind);
-
 	return (
 		<Dialog.Root open={open} onOpenChange={(open) => (getQuickPreviewStore().open = open)}>
 			<QuickPreviewContext.Provider value={{ background }}>
 				<Dialog.Portal forceMount>
 					<Dialog.Overlay
 						className={clsx(
-							'absolute inset-0 z-50',
+							'absolute inset-0 z-[100]',
 							'radix-state-open:animate-in radix-state-open:fade-in-0',
 							isDark ? 'bg-black/80' : 'bg-black/60'
 						)}
@@ -188,7 +313,7 @@ export const QuickPreview = () => {
 					/>
 
 					<Dialog.Content
-						className="fixed inset-[5%] z-50 outline-none radix-state-open:animate-in radix-state-open:fade-in-0 radix-state-open:zoom-in-95"
+						className="fixed inset-[5%] z-[100] outline-none radix-state-open:animate-in radix-state-open:fade-in-0 radix-state-open:zoom-in-95"
 						onOpenAutoFocus={(e) => e.preventDefault()}
 						onEscapeKeyDown={(e) => isRenaming && e.preventDefault()}
 						onContextMenu={(e) => e.preventDefault()}
@@ -203,19 +328,15 @@ export const QuickPreview = () => {
 					>
 						<div
 							className={clsx(
-								'flex h-full overflow-hidden rounded-md border',
+								'relative flex h-full overflow-hidden rounded-md border',
 								isDark ? 'border-app-line/80' : 'border-app-line/10'
 							)}
 						>
-							<div className="relative flex flex-1 flex-col overflow-hidden bg-app/80 backdrop-blur">
-								{background && (
+							<div className="relative flex flex-1 flex-col justify-between overflow-hidden bg-app/80 backdrop-blur">
+								{!hasError && isLoaded && background && (
 									<div className="absolute inset-0 overflow-hidden">
-										<FileThumb
-											data={item}
-											cover={true}
-											childClassName="scale-125"
-										/>
-										<div className="absolute inset-0 bg-black/25 backdrop-blur-3xl" />
+										<FileThumb data={item} cover childClassName="scale-125" />
+										<div className="absolute inset-0 bg-black/50 backdrop-blur-3xl" />
 									</div>
 								)}
 								<div
@@ -225,7 +346,7 @@ export const QuickPreview = () => {
 									)}
 								>
 									<div className="flex flex-1">
-										<Tooltip label="Close">
+										<Tooltip label={t('close')}>
 											<Dialog.Close asChild>
 												<IconButton>
 													<X weight="bold" />
@@ -233,9 +354,29 @@ export const QuickPreview = () => {
 											</Dialog.Close>
 										</Tooltip>
 
+										{thumbnailLoading.original === 'error' &&
+											thumbnailLoading.thumbnail === 'loaded' && (
+												<Tooltip
+													label={t('quickpreview_thumbnail_error_tip')}
+												>
+													<div className="ml-1 flex items-center gap-1 rounded-md border border-white/5 bg-app-lightBox/30 p-1.5 backdrop-blur-md">
+														<WarningCircle
+															className="text-red-500"
+															weight="fill"
+															size={14}
+														/>
+														<p className="text-xs text-ink">
+															{t(
+																'quickpreview_thumbnail_error_message'
+															)}
+														</p>
+													</div>
+												</Tooltip>
+											)}
+
 										{items.length > 1 && (
 											<div className="ml-2 flex">
-												<Tooltip label="Back">
+												<Tooltip label={t('back')}>
 													<IconButton
 														disabled={!items[itemIndex - 1]}
 														onClick={() =>
@@ -247,7 +388,7 @@ export const QuickPreview = () => {
 													</IconButton>
 												</Tooltip>
 
-												<Tooltip label="Forward">
+												<Tooltip label={t('forward')}>
 													<IconButton
 														disabled={!items[itemIndex + 1]}
 														onClick={() =>
@@ -334,8 +475,11 @@ export const QuickPreview = () => {
 														setNewName(newName);
 													} catch (e) {
 														toast.error({
-															title: `Could not rename ${itemData.fullName} to ${newName}`,
-															body: `Error: ${e}.`
+															title: t('failed_to_rename_file', {
+																oldName: itemData.fullName,
+																newName
+															}),
+															body: t('error_message', { error: e })
 														});
 													}
 												}}
@@ -352,11 +496,29 @@ export const QuickPreview = () => {
 										)}
 									</div>
 
-									<div className="flex flex-1 justify-end gap-1">
+									<div className="flex flex-1 items-center justify-end gap-1">
+										<Tooltip label={t('zoom_in')}>
+											<IconButton
+												onClick={handleZoomIn}
+												// this is same formula as interest calculation
+											>
+												<MagnifyingGlassPlus />
+											</IconButton>
+										</Tooltip>
+
+										<Tooltip label={t('zoom_out')}>
+											<IconButton
+												onClick={handleZoomOut}
+												// this is same formula as interest calculation
+											>
+												<MagnifyingGlassMinus />
+											</IconButton>
+										</Tooltip>
+
 										<DropdownMenu.Root
 											trigger={
 												<div className="flex">
-													<Tooltip label="More">
+													<Tooltip label={t('more')}>
 														<IconButton>
 															<DotsThree size={20} weight="bold" />
 														</IconButton>
@@ -376,7 +538,7 @@ export const QuickPreview = () => {
 												/>
 
 												<DropdownMenu.Item
-													label="Rename"
+													label={t('rename')}
 													onClick={() => name && setIsRenaming(true)}
 												/>
 
@@ -389,13 +551,14 @@ export const QuickPreview = () => {
 														FilePathItems.CopyAsPath,
 														FilePathItems.Crypto,
 														FilePathItems.Compress,
-														ObjectItems.ConvertObject,
-														FilePathItems.SecureDelete
+														ObjectItems.ConvertObject
+														// FilePathItems.SecureDelete
 													]}
 												>
 													{(items) => (
 														<DropdownMenu.SubMenu
-															label="More actions..."
+															label={t('more_actions')}
+															// @ts-expect-error
 															icon={Plus}
 														>
 															{items}
@@ -409,7 +572,26 @@ export const QuickPreview = () => {
 											</ExplorerContextMenu>
 										</DropdownMenu.Root>
 
-										<Tooltip label="Show details">
+										<Tooltip label={t('show_slider')}>
+											<IconButton
+												onClick={() =>
+													(explorerLayoutStore.showImageSlider =
+														!explorerLayoutStore.showImageSlider)
+												}
+												className="w-fit px-2 text-[10px]"
+											>
+												<Slideshow
+													size={16.5}
+													weight={
+														explorerLayoutStore.showImageSlider
+															? 'fill'
+															: 'regular'
+													}
+												/>
+											</IconButton>
+										</Tooltip>
+
+										<Tooltip label={t('show_details')}>
 											<IconButton
 												onClick={() => setShowMetadata(!showMetadata)}
 												active={showMetadata}
@@ -425,19 +607,29 @@ export const QuickPreview = () => {
 
 								<FileThumb
 									data={item}
-									onLoad={(type) =>
-										type === 'ORIGINAL' && setThumbErrorToast(undefined)
-									}
-									onError={(type, error) =>
-										type === 'ORIGINAL' &&
-										setThumbErrorToast({
-											title: 'Error loading original file',
-											body: error.message
-										})
-									}
+									onLoad={(type) => {
+										setThumbnailLoading((obj) => ({
+											...obj,
+											[type]: 'loaded'
+										}));
+									}}
+									onError={(state, error) => {
+										console.error(error);
+										setThumbnailLoading((obj) => {
+											const newState = { ...obj };
+											for (const [type, loadState] of Object.entries(
+												state
+											) as [ThumbType, string][])
+												if (loadState === 'error') newState[type] = 'error';
+
+											return newState;
+										});
+									}}
 									loadOriginal
+									frameClassName="!border-0"
 									mediaControls
 									className={clsx(
+										!isLoaded && 'hidden',
 										'm-3 !w-auto flex-1 !overflow-hidden rounded',
 										!background && !icon && 'bg-app-box shadow'
 									)}
@@ -447,7 +639,12 @@ export const QuickPreview = () => {
 										!icon && 'h-full',
 										textKinds.includes(kind) && 'select-text'
 									)}
+									magnification={magnification}
 								/>
+
+								{explorerLayoutStore.showImageSlider && activeItem && (
+									<ImageSlider activeItem={activeItem} />
+								)}
 							</div>
 
 							{showMetadata && (
@@ -529,8 +726,8 @@ const RenameInput = ({ name, onRename }: RenameInputProps) => {
 					quickPreview.background
 						? 'border-white/[.12] bg-white/10 backdrop-blur-sm'
 						: isDark
-						? 'border-app-line bg-app-input'
-						: 'border-black/[.075] bg-black/[.075]'
+							? 'border-app-line bg-app-input'
+							: 'border-black/[.075] bg-black/[.075]'
 				)}
 				onKeyDown={handleKeyDown}
 				onFocus={() => highlightName()}
@@ -556,7 +753,7 @@ const IconButton = ({
 	return (
 		<button
 			className={clsx(
-				'text-md inline-flex h-[30px] w-[30px] items-center justify-center rounded opacity-80 outline-none',
+				'text-md inline-flex size-[30px] items-center justify-center rounded opacity-80 outline-none',
 				'hover:opacity-100',
 				'focus:opacity-100',
 				'disabled:pointer-events-none disabled:opacity-40',

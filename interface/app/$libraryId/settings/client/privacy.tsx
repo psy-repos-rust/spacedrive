@@ -1,27 +1,47 @@
-import { telemetryStore, useTelemetryState } from '@sd/client';
-import { Switch } from '@sd/ui';
+import { TelemetryLevelPreference, telemetryState, useTelemetryState } from '@sd/client';
+import { Select, SelectOption } from '@sd/ui';
+import i18n from '~/app/I18n';
+import { useLocale } from '~/hooks';
 
 import { Heading } from '../Layout';
 import Setting from '../Setting';
 
+const telemetryPreferenceOptions = [
+	{ value: 'full', label: i18n.t('telemetry_share_anonymous_short') },
+	{ value: 'minimal', label: i18n.t('telemetry_share_minimal_short') },
+	{ value: 'none', label: i18n.t('telemetry_share_none_short') }
+] satisfies { value: TelemetryLevelPreference; label: string }[];
+
 export const Component = () => {
-	const fullTelemetry = useTelemetryState().shareFullTelemetry;
+	const { t } = useLocale();
+
+	const { telemetryLevelPreference } = useTelemetryState();
 
 	return (
 		<>
-			<Heading title="Privacy" description="" />
+			<Heading title={t('privacy')} description="" />
+
 			<Setting
 				mini
-				toolTipLabel="Learn more about telemetry"
+				toolTipLabel={t('learn_more_about_telemetry')}
 				infoUrl="https://www.spacedrive.com/docs/product/resources/privacy"
-				title="Share Additional Telemetry and Usage Data"
-				description="Toggle ON to provide developers with detailed usage and telemetry data to enhance the app. Toggle OFF to send only basic data: your activity status, app version, core version, and platform (e.g., mobile, web, or desktop)."
+				title={t('telemetry_title')}
+				description={t('telemetry_description')}
 			>
-				<Switch
-					checked={fullTelemetry}
-					onClick={() => (telemetryStore.shareFullTelemetry = !fullTelemetry)}
-					size="md"
-				/>
+				<Select
+					value={telemetryLevelPreference}
+					onChange={(newValue) => {
+						// add "dateFormat" key to localStorage and set it as default date format
+						telemetryState.telemetryLevelPreference = newValue;
+					}}
+					containerClassName="flex h-[30px] gap-2"
+				>
+					{telemetryPreferenceOptions.map((format, index) => (
+						<SelectOption key={index} value={format.value}>
+							{format.label}
+						</SelectOption>
+					))}
+				</Select>
 			</Setting>
 		</>
 	);

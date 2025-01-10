@@ -2,6 +2,7 @@ import { Clipboard } from '@phosphor-icons/react';
 import { ReactNode } from 'react';
 import { useZodForm } from '@sd/client';
 import { Button, Dialog, dialogManager, Input, useDialog, UseDialogProps } from '@sd/ui';
+import { useLocale } from '~/hooks';
 
 interface Props extends UseDialogProps {
 	title: string; // dialog title
@@ -14,13 +15,15 @@ interface Props extends UseDialogProps {
 }
 
 const AlertDialog = (props: Props) => {
+	const { t } = useLocale();
+
 	// maybe a copy-to-clipboard button would be beneficial too
 	return (
 		<Dialog
 			title={props.title}
 			form={useZodForm()}
 			dialog={useDialog(props)}
-			ctaLabel={props.label !== undefined ? props.label : 'Done'}
+			ctaLabel={props.label !== undefined ? props.label : t('done')}
 			cancelBtn={props.cancelBtn}
 			onCancelled={false}
 		>
@@ -35,11 +38,11 @@ const AlertDialog = (props: Props) => {
 						<Button
 							type="button"
 							onClick={() => {
-								props.value && navigator.clipboard.writeText(props.value);
+								if (props.value) navigator.clipboard.writeText(props.value);
 							}}
 							size="icon"
 						>
-							<Clipboard className="h-4 w-4" />
+							<Clipboard className="size-4" />
 						</Button>
 					}
 				/>

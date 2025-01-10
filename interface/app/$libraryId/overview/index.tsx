@@ -1,76 +1,141 @@
-import { getIcon } from '@sd/assets/util';
-import { useEffect, useState } from 'react';
+import { keepPreviousData } from '@tanstack/react-query';
+import { Key, useEffect } from 'react';
+import { Link } from 'react-router-dom';
+import { HardwareModel, useBridgeQuery, useLibraryQuery } from '@sd/client';
+import { useAccessToken, useLocale, useOperatingSystem } from '~/hooks';
+import { useRouteTitle } from '~/hooks/useRouteTitle';
+import { hardwareModelToIcon } from '~/util/hardware';
 
-import 'react-loading-skeleton/dist/skeleton.css';
-
-import { useSnapshot } from 'valtio';
-import { Category } from '@sd/client';
-
-import { useIsDark } from '../../../hooks';
-import { ExplorerContextProvider } from '../Explorer/Context';
-import ContextMenu, { ObjectItems } from '../Explorer/ContextMenu';
-import { Conditional } from '../Explorer/ContextMenu/ConditionalItem';
-import { DefaultTopBarOptions } from '../Explorer/TopBarOptions';
-import View from '../Explorer/View';
-import Statistics from '../overview/Statistics';
-import { usePageLayoutContext } from '../PageLayout/Context';
+import { SearchContextProvider, useSearchFromSearchParams } from '../search';
+import SearchBar from '../search/SearchBar';
+import { AddLocationButton } from '../settings/library/locations/AddLocationButton';
 import { TopBarPortal } from '../TopBar/Portal';
-import { Categories } from './Categories';
-import { IconForCategory, IconToDescription, useCategoryExplorer } from './data';
-import Inspector from './Inspector';
+import TopBarOptions from '../TopBar/TopBarOptions';
+import FileKindStatistics from './FileKindStats';
+import OverviewSection from './Layout/Section';
+import LibraryStatistics from './LibraryStats';
+import NewCard from './NewCard';
+import StatisticItem from './StatCard';
+
+export interface FileKind {
+	kind: number;
+	name: string;
+	count: bigint;
+	total_bytes: bigint;
+}
 
 export const Component = () => {
-	const isDark = useIsDark();
-	const page = usePageLayoutContext();
+	useRouteTitle('Overview');
+	const os = useOperatingSystem();
 
-	const [selectedCategory, setSelectedCategory] = useState<Category>('Recents');
+	const { t } = useLocale();
+	const accessToken = useAccessToken();
 
-	const explorer = useCategoryExplorer(selectedCategory);
+	const locationsQuery = useLibraryQuery(['locations.list'], {
+		placeholderData: keepPreviousData
+	});
+	const locations = locationsQuery.data ?? [];
+
+	// not sure if we'll need the node state in the future, as it should be returned with the cloud.devices.list query
+	// const { data: node } = useBridgeQuery(['nodeState']);
+	const cloudDevicesList = useBridgeQuery(['cloud.devices.list']);
 
 	useEffect(() => {
-		if (!page.ref.current) return;
+		const interval = setInterval(async () => {
+			await cloudDevicesList.refetch();
+		}, 10000);
+		return () => clearInterval(interval);
+	}, []);
+	const { data: node } = useBridgeQuery(['nodeState']);
+	const stats = useLibraryQuery(['library.statistics']);
 
-		const { scrollTop } = page.ref.current;
-		if (scrollTop > 100) page.ref.current.scrollTo({ top: 100 });
-	}, [selectedCategory, page.ref]);
-
-	const settings = useSnapshot(explorer.settingsStore);
+	const search = useSearchFromSearchParams({ defaultTarget: 'paths' });
 
 	return (
-		<ExplorerContextProvider explorer={explorer}>
-			<TopBarPortal right={<DefaultTopBarOptions />} />
-
-			<Statistics />
-			{/* <div className="mt-2 w-full" /> */}
-			<Categories selected={selectedCategory} onSelectedChanged={setSelectedCategory} />
-
-			<div className="flex flex-1">
-				<View
-					top={114}
-					className={settings.layoutMode === 'list' ? 'min-w-0' : undefined}
-					contextMenu={
-						<ContextMenu>
-							<Conditional items={[ObjectItems.RemoveFromRecents]} />
-						</ContextMenu>
-					}
-					emptyNotice={
-						<div className="flex h-full flex-col items-center justify-center text-white">
-							<img
-								src={getIcon(
-									IconForCategory[selectedCategory] || 'Document',
-									isDark
-								)}
-								className="h-32 w-32"
-							/>
-							<h1 className="mt-4 text-lg font-bold">{selectedCategory}</h1>
-							<p className="mt-1 text-sm text-ink-dull">
-								{IconToDescription[selectedCategory]}
-							</p>
+		<SearchContextProvider search={search}>
+			<div>
+				<TopBarPortal
+					left={
+						<div className="flex items-center gap-2">
+							<span className="truncate text-sm font-medium">
+								{t('library_overview')}
+							</span>
 						</div>
 					}
+					center={<SearchBar redirectToSearch />}
+					right={os === 'windows' && <TopBarOptions />}
 				/>
-				<Inspector />
+				<div className="mt-4 flex flex-col gap-3 pt-3">
+					<OverviewSection>
+						<LibraryStatistics />
+						<FileKindStatistics />
+					</OverviewSection>
+
+					<OverviewSection
+						count={(cloudDevicesList.data?.length ?? 0) + (node ? 1 : 0)}
+						title={t('devices')}
+					>
+						{node && (
+							<StatisticItem
+								name={node.name}
+								icon={hardwareModelToIcon(node.device_model as any)}
+								totalSpace={
+									stats.data?.statistics?.total_local_bytes_capacity || '0'
+								}
+								freeSpace={stats.data?.statistics?.total_local_bytes_free || '0'}
+								color="#0362FF"
+								connectionType={null}
+							/>
+						)}
+						{cloudDevicesList.data?.map((device) => (
+							<StatisticItem
+								key={device.pub_id}
+								name={device.name}
+								icon={hardwareModelToIcon(device.hardware_model as HardwareModel)}
+								totalSpace="0"
+								freeSpace="0"
+								color="#0362FF"
+								connectionType={'cloud'}
+							/>
+						))}
+					</OverviewSection>
+
+					<OverviewSection count={locations.length} title={t('locations')}>
+						{locations?.map((item) => (
+							<Link key={item.id} to={`../location/${item.id}`}>
+								<StatisticItem
+									name={item.name || t('unnamed_location')}
+									icon="Folder"
+									totalSpace={item.size_in_bytes || [0]}
+									color="#0362FF"
+									connectionType={null}
+								/>
+							</Link>
+						))}
+						{!locations?.length && (
+							<NewCard
+								icons={['HDD', 'Folder', 'Globe', 'SD']}
+								text={t('add_location_overview_description')}
+								button={() => <AddLocationButton variant="outline" />}
+							/>
+						)}
+					</OverviewSection>
+
+					<OverviewSection count={0} title={t('cloud_drives')}>
+						<NewCard
+							icons={[
+								'DriveAmazonS3',
+								'DriveDropbox',
+								'DriveGoogleDrive',
+								'DriveOneDrive'
+								// 'DriveBox'
+							]}
+							text={t('connect_cloud_description')}
+							// buttonText={t('connect_cloud)}
+						/>
+					</OverviewSection>
+				</div>
 			</div>
-		</ExplorerContextProvider>
+		</SearchContextProvider>
 	);
 };

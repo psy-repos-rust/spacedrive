@@ -1,9 +1,11 @@
 import { CheckSquare } from '@phosphor-icons/react';
+import { useQueryClient } from '@tanstack/react-query';
+import { SetStateAction, useContext } from 'react';
+import { useNavigate } from 'react-router';
 import {
+	auth,
 	backendFeatures,
 	features,
-	getDebugState,
-	isEnabled,
 	toggleFeatureFlag,
 	useBridgeMutation,
 	useBridgeQuery,
@@ -21,9 +23,15 @@ import {
 	Switch,
 	usePopover
 } from '@sd/ui';
+import { toggleRenderRects } from '~/hooks';
 import { usePlatform } from '~/util/Platform';
 
+import {
+	explorerOperatingSystemStore,
+	useExplorerOperatingSystem
+} from '../../Explorer/useExplorerOperatingSystem';
 import Setting from '../../settings/Setting';
+import { SidebarContext, useSidebarContext } from './SidebarLayout/Context';
 
 export default () => {
 	const buildInfo = useBridgeQuery(['buildInfo']);
@@ -31,18 +39,33 @@ export default () => {
 
 	const debugState = useDebugState();
 	const platform = usePlatform();
+	const navigate = useNavigate();
+
+	const sidebar = useContext(SidebarContext);
+
+	const popover = usePopover();
+
+	function handleOpenChange(action: SetStateAction<boolean>) {
+		const open = typeof action === 'boolean' ? action : !popover.open;
+		popover.setOpen(open);
+		sidebar?.onLockedChange(open);
+	}
 
 	return (
 		<Popover
-			popover={usePopover()}
-			className="p-4 focus:outline-none"
+			popover={{ ...popover, setOpen: handleOpenChange }}
+			className="z-[100] p-4 focus:outline-none"
 			trigger={
-				<h1 className="ml-1 w-full text-[7pt] text-sidebar-inkFaint/50">
+				<h1 className="ml-1 w-full font-plex text-[7pt] tracking-widest text-sidebar-inkFaint/50">
 					v{buildInfo.data?.version || '-.-.-'} - {buildInfo.data?.commit || 'dev'}
 				</h1>
 			}
 		>
 			<div className="no-scrollbar block h-96 w-[430px] overflow-y-scroll pb-4">
+				{/* <Setting mini title="Cloud Origin" description="Change the cloud origin to use">
+					<CloudOriginSelect />
+				</Setting> */}
+
 				<Setting
 					mini
 					title="rspc Logger"
@@ -50,7 +73,7 @@ export default () => {
 				>
 					<Switch
 						checked={debugState.rspcLogger}
-						onClick={() => (getDebugState().rspcLogger = !debugState.rspcLogger)}
+						onClick={() => (debugState.rspcLogger = !debugState.rspcLogger)}
 					/>
 				</Setting>
 				<Setting
@@ -67,8 +90,8 @@ export default () => {
 								!debugState.shareFullTelemetry === false &&
 								debugState.telemetryLogging
 							)
-								getDebugState().telemetryLogging = false;
-							getDebugState().shareFullTelemetry = !debugState.shareFullTelemetry;
+								debugState.telemetryLogging = false;
+							debugState.shareFullTelemetry = !debugState.shareFullTelemetry;
 						}}
 					/>
 				</Setting>
@@ -86,8 +109,8 @@ export default () => {
 								!debugState.telemetryLogging &&
 								debugState.shareFullTelemetry === false
 							)
-								getDebugState().shareFullTelemetry = true;
-							getDebugState().telemetryLogging = !debugState.telemetryLogging;
+								debugState.shareFullTelemetry = true;
+							debugState.telemetryLogging = !debugState.telemetryLogging;
 						}}
 					/>
 				</Setting>
@@ -118,7 +141,7 @@ export default () => {
 								size="sm"
 								variant="gray"
 								onClick={() => {
-									platform.reloadWebview && platform.reloadWebview();
+									if (platform.reloadWebview) platform.reloadWebview();
 								}}
 							>
 								Reload
@@ -131,19 +154,31 @@ export default () => {
 					title="React Query Devtools"
 					description="Configure the React Query devtools."
 				>
-					<Select
-						value={debugState.reactQueryDevtools}
-						size="sm"
-						onChange={(value) => (getDebugState().reactQueryDevtools = value as any)}
-					>
-						<SelectOption value="disabled">Disabled</SelectOption>
-						<SelectOption value="invisible">Invisible</SelectOption>
-						<SelectOption value="enabled">Enabled</SelectOption>
-					</Select>
+					<Switch
+						checked={debugState.reactQueryDevtools}
+						onClick={() =>
+							(debugState.reactQueryDevtools = !debugState.reactQueryDevtools)
+						}
+					/>
 				</Setting>
-				<FeatureFlagSelector />
+				<Setting
+					mini
+					title="Explorer behavior"
+					description="Change the explorer selection behavior"
+				>
+					<ExplorerBehaviorSelect />
+				</Setting>
+				{/* <FeatureFlagSelector /> */}
 				<InvalidateDebugPanel />
-				<TestNotifications />
+				{/* <TestNotifications /> */}
+				<div className="flex gap-2">
+					<Button size="sm" variant="gray" onClick={() => navigate('./debug/cache')}>
+						Cache Debug
+					</Button>
+					<Button size="sm" variant="gray" onClick={() => toggleRenderRects()}>
+						Toggle DND Rects
+					</Button>
+				</div>
 
 				{/* {platform.showDevtools && (
 					<SettingContainer
@@ -182,41 +217,56 @@ function InvalidateDebugPanel() {
 	);
 }
 
-function FeatureFlagSelector() {
-	useFeatureFlags(); // Subscribe to changes
+// function TestNotifications() {
+// 	const coreNotif = useBridgeMutation(['notifications.test']);
+// 	const libraryNotif = useLibraryMutation(['notifications.testLibrary']);
+
+// 	return (
+// 		<Setting mini title="Notifications" description="Test the notification system">
+// 			<Button onClick={() => coreNotif.mutate(undefined)}>Core</Button>
+// 			<Button onClick={() => libraryNotif.mutate(null)}>Library</Button>
+// 		</Setting>
+// 	);
+// }
+
+// function CloudOriginSelect() {
+// 	const origin = useBridgeQuery(['cloud.getApiOrigin']);
+// 	const setOrigin = useBridgeMutation(['cloud.setApiOrigin']);
+
+// 	const queryClient = useQueryClient();
+
+// 	return (
+// 		<>
+// 			{origin.data && (
+// 				<Select
+// 					onChange={(v) =>
+// 						setOrigin.mutateAsync(v).then(() => {
+// 							auth.logout();
+// 							queryClient.invalidateQueries();
+// 						})
+// 					}
+// 					value={origin.data}
+// 				>
+// 					<SelectOption value="https://api.spacedrive.com">
+// 						https://api.spacedrive.com
+// 					</SelectOption>
+// 					<SelectOption value="http://localhost:3000">http://localhost:3000</SelectOption>
+// 				</Select>
+// 			)}
+// 		</>
+// 	);
+// }
+
+function ExplorerBehaviorSelect() {
+	const { explorerOperatingSystem } = useExplorerOperatingSystem();
 
 	return (
-		<DropdownMenu.Root
-			trigger={
-				<Dropdown.Button variant="gray" className="w-full">
-					<span className="truncate">Feature Flags</span>
-				</Dropdown.Button>
-			}
-			className="mt-1 shadow-none data-[side=bottom]:slide-in-from-top-2 dark:divide-menu-selected/30 dark:border-sidebar-line dark:bg-sidebar-box"
-			alignToTrigger
+		<Select
+			value={explorerOperatingSystem}
+			onChange={(v) => (explorerOperatingSystemStore.os = v)}
 		>
-			{[...features, ...backendFeatures].map((feat) => (
-				<DropdownMenu.Item
-					key={feat}
-					label={feat}
-					iconProps={{ weight: 'bold', size: 16 }}
-					onClick={() => toggleFeatureFlag(feat)}
-					className="font-medium text-white"
-					icon={isEnabled(feat) ? CheckSquare : undefined}
-				/>
-			))}
-		</DropdownMenu.Root>
-	);
-}
-
-function TestNotifications() {
-	const coreNotif = useBridgeMutation(['notifications.test']);
-	const libraryNotif = useLibraryMutation(['notifications.testLibrary']);
-
-	return (
-		<Setting mini title="Notifications" description="Test the notification system">
-			<Button onClick={() => coreNotif.mutate(undefined)}>Core</Button>
-			<Button onClick={() => libraryNotif.mutate(null)}>Library</Button>
-		</Setting>
+			<SelectOption value="macOS">macOS</SelectOption>
+			<SelectOption value="windows">windows</SelectOption>
+		</Select>
 	);
 }
